@@ -59,9 +59,17 @@ def fetch_bhav_copy(date: datetime):
 
 
 def get_most_recent_bhav():
-    day = datetime.now() - timedelta(days=1)
-    while day.weekday() in (5, 6):
-        day -= timedelta(days=1)
+    now = datetime.now()
+    
+    # NSE uploads Bhav Copy after 4:30 PM IST
+    # If it's past 4:30 PM on a weekday, try today first
+    if now.weekday() not in (5, 6) and now.hour >= 16:
+        day = now  # try today
+    else:
+        day = now - timedelta(days=1)
+        while day.weekday() in (5, 6):
+            day -= timedelta(days=1)
+
     for _ in range(7):
         csv_data, date_label = fetch_bhav_copy(day)
         if csv_data:
