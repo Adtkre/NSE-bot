@@ -9,7 +9,6 @@ import random
 from datetime import datetime, timedelta
 import os
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
 TOKEN = os.environ.get("TOKEN")
 PREFIX = "!"
 
@@ -29,18 +28,13 @@ HEADERS = {
 FUTURES_TYPES = {"STF", "IDF"}
 
 
-def get_prev_trading_day():
-    day = datetime.now() - timedelta(days=1)
-    while day.weekday() in (5, 6):
-        day -= timedelta(days=1)
-    return day
-
-
 def make_nse_session():
     session = requests.Session()
     session.headers.update(HEADERS)
     try:
         session.get("https://www.nseindia.com", timeout=15)
+        time.sleep(random.uniform(1.5, 2.5))
+        session.get("https://www.nseindia.com/market-data/oi-spurts", timeout=15)
         time.sleep(random.uniform(1, 2))
     except Exception:
         pass
@@ -48,6 +42,7 @@ def make_nse_session():
 
 
 def fetch_bhav_copy(date: datetime):
+    """Try to download Bhav Copy for given date. Returns (csv_content, date_label) or (None, date_label)."""
     date_str   = date.strftime("%Y%m%d")
     date_label = date.strftime("%d %b %Y (%A)")
 
@@ -56,28 +51,78 @@ def fetch_bhav_copy(date: datetime):
         f"https://www.nseindia.com/content/historical/DERIVATIVES/{date.year}/{date.strftime('%b').upper()}/fo{date.strftime('%d%b%Y').upper()}bhav.csv.zip",
     ]
 
-    session = make_nse_session()
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    try:
+        session.get("https://www.nseindia.com", timeout=15)
+        time.sleep(1)
+    except Exception:
+        pass
 
     for url in urls:
         try:
             r = session.get(url, timeout=30)
+            print(f"[bhav] {url} → {r.status_code} size={len(r.content)}")
             if r.status_code == 200 and len(r.content) > 1000:
                 with zipfile.ZipFile(io.BytesIO(r.content)) as z:
                     with z.open(z.namelist()[0]) as f:
-                        content = f.read().decode("utf-8", errors="replace")
-                return content, date_label
+                        csv_data = f.read().decode("utf-8", errors="replace")
+                print(f"[bhav] ✅ Got data for {date_label}")
+                return csv_data, date_label
         except Exception as e:
             print(f"[bhav] error: {e}")
             continue
 
+    print(f"[bhav] ❌ No data for {date_label}")
     return None, date_label
 
 
-def fetch_nse_gainers_losers(session):
+def get_most_recent_bhav():
     """
-    Fetch top gainers and losers from NSE live API.
-    Returns set of symbols appearing in gainers or losers.
+    Find the most recent available Bhav Copy.
+    Start from yesterday, go back up to 7 trading days.
     """
+    day = datetime.now() - timedelta(days=1)
+    # Skip weekends
+    while day.weekday() in (5, 6):
+        day -= timedelta(days=1)
+
+    for _ in range(7):
+        csv_data, date_label = fetch_bhav_copy(day)
+        if csv_data:
+            return csv_data, date_label, day
+        # Go back one more trading day
+        day -= timedelta(days=1)
+        while day.weekday() in (5, 6):
+            day -= timedelta(days=1)
+
+    return None, None, None
+
+
+def fetch_oi_spurts_symbols(session):
+    """Fetch symbols from NSE OI Spurts page."""
+    symbols = set()
+    url = "https://www.nseindia.com/api/live-analysis-oi-spurts-underlyings"
+    try:
+        r = session.get(url, timeout=15)
+        print(f"[oi-spurts] status={r.status_code} len={len(r.text)}")
+        if r.status_code == 200:
+            text = r.text.strip()
+            if text and text[0] in ('[', '{'):
+                data = r.json()
+                records = data if isinstance(data, list) else data.get("data", [])
+                for item in records:
+                    sym = item.get("symbol", item.get("Symbol", "")).strip().upper()
+                    if sym:
+                        symbols.add(sym)
+    except Exception as e:
+        print(f"[oi-spurts] error: {e}")
+    print(f"[oi-spurts] found {len(symbols)} symbols: {list(symbols)[:10]}")
+    return symbols
+
+
+def fetch_gainers_losers_symbols(session):
+    """Fetch symbols from NSE Top Gainers & Losers."""
     symbols = set()
     urls = [
         "https://www.nseindia.com/api/live-analysis-variations?index=gainers&limit=50",
@@ -86,57 +131,32 @@ def fetch_nse_gainers_losers(session):
     for url in urls:
         try:
             r = session.get(url, timeout=15)
+            print(f"[gainers/losers] {url} → {r.status_code}")
             if r.status_code == 200:
+                text = r.text.strip()
+                if not text or text[0] not in ('[', '{'):
+                    continue
                 data = r.json()
-                records = data if isinstance(data, list) else data.get("data", data.get("NIFTY", []))
-                if isinstance(records, dict):
-                    # sometimes nested under market type keys
-                    for v in records.values():
-                        if isinstance(v, list):
-                            for item in v:
-                                sym = item.get("symbol", item.get("Symbol", ""))
+                # NSE returns nested dict with keys like NIFTY, BANKNIFTY etc
+                if isinstance(data, dict):
+                    for key, val in data.items():
+                        if isinstance(val, list):
+                            for item in val:
+                                sym = item.get("symbol", item.get("Symbol", "")).strip().upper()
                                 if sym:
-                                    symbols.add(sym.upper())
-                else:
-                    for item in records:
-                        sym = item.get("symbol", item.get("Symbol", ""))
+                                    symbols.add(sym)
+                elif isinstance(data, list):
+                    for item in data:
+                        sym = item.get("symbol", item.get("Symbol", "")).strip().upper()
                         if sym:
-                            symbols.add(sym.upper())
+                            symbols.add(sym)
         except Exception as e:
             print(f"[gainers/losers] error: {e}")
-    print(f"[gainers/losers] symbols found: {len(symbols)} → {list(symbols)[:10]}")
-    return symbols
-
-
-def fetch_oi_spurts(session):
-    """
-    Fetch OI spurts symbols from NSE live API.
-    Returns set of symbols in OI spurts.
-    """
-    symbols = set()
-    url = "https://www.nseindia.com/api/live-analysis-oi-spurts-underlyings"
-    try:
-        r = session.get(url, timeout=15)
-        if r.status_code == 200:
-            text = r.text.strip()
-            if text and text[0] in ('[', '{'):
-                data = r.json()
-                records = data if isinstance(data, list) else data.get("data", [])
-                for item in records:
-                    sym = item.get("symbol", item.get("Symbol", ""))
-                    if sym:
-                        symbols.add(sym.upper())
-    except Exception as e:
-        print(f"[oi-spurts] error: {e}")
-    print(f"[oi-spurts] symbols found: {len(symbols)} → {list(symbols)[:10]}")
+    print(f"[gainers/losers] found {len(symbols)} symbols: {list(symbols)[:10]}")
     return symbols
 
 
 def parse_bhav_oi(csv_content, threshold_pct, filter_symbols=None):
-    """
-    Parse Bhav Copy CSV.
-    If filter_symbols is provided, only include those symbols.
-    """
     reader = csv.DictReader(io.StringIO(csv_content))
     rows = [{k.strip(): v.strip() for k, v in row.items()} for row in reader]
 
@@ -144,7 +164,6 @@ def parse_bhav_oi(csv_content, threshold_pct, filter_symbols=None):
         raise Exception("CSV is empty.")
 
     symbol_data = {}
-
     for row in rows:
         inst = row.get("FinInstrmTp", row.get("Instrument", row.get("INSTRUMENT", ""))).strip()
         is_future = inst in FUTURES_TYPES or "FUT" in inst.upper()
@@ -155,7 +174,6 @@ def parse_bhav_oi(csv_content, threshold_pct, filter_symbols=None):
         if not symbol:
             continue
 
-        # If filter active, skip symbols not in filter
         if filter_symbols is not None and symbol not in filter_symbols:
             continue
 
@@ -168,7 +186,6 @@ def parse_bhav_oi(csv_content, threshold_pct, filter_symbols=None):
 
         if symbol not in symbol_data:
             symbol_data[symbol] = {"curr_oi": 0.0, "oi_chg": 0.0, "ltp": 0.0}
-
         symbol_data[symbol]["curr_oi"] += curr_oi
         symbol_data[symbol]["oi_chg"]  += oi_chg
         if ltp:
@@ -196,10 +213,8 @@ def parse_bhav_oi(csv_content, threshold_pct, filter_symbols=None):
 
 
 def fmt(title, rows, emoji):
-    """Returns list of message chunks (each under 1990 chars)."""
     if not rows:
         return [f"**{emoji} {title}**\n*No stocks found*"]
-
     header = (
         f"**{emoji} {title}** ({len(rows)} stocks)\n"
         f"```\n"
@@ -212,16 +227,14 @@ def fmt(title, rows, emoji):
         f"{r['prev_oi']:>11,}  {r['curr_oi']:>11,}  {r['ltp']:>8.2f}"
         for r in rows
     ]
-
     chunks = []
     current = header
     for line in row_lines:
-        candidate = current + line + "\n"
-        if len(candidate + footer) > 1900:
+        if len(current + line + "\n" + footer) > 1900:
             chunks.append(current + footer)
             current = "```\n" + line + "\n"
         else:
-            current = candidate
+            current += line + "\n"
     chunks.append(current + footer)
     return chunks
 
@@ -230,67 +243,52 @@ def fmt(title, rows, emoji):
 async def nse_oi(ctx, threshold: float = 2.0):
     """
     !nse <percent>
-    Shows stocks that appear in BOTH OI Spurts AND Top Gainers/Losers on NSE,
-    filtered by OI change threshold from Bhav Copy.
-    Example: !nse 3
+    Shows stocks present in BOTH NSE OI Spurts AND Top Gainers/Losers,
+    with OI change >= ±threshold% from Bhav Copy EOD data.
     """
     if not 0.1 <= threshold <= 100:
-        await ctx.send("❌ Example: `!nse 3` for ±3% OI change filter")
+        await ctx.send("❌ Example: `!nse 3`")
         return
 
-    msg = await ctx.send("⏳ Fetching NSE data...")
+    msg = await ctx.send("⏳ Step 1/3 — Fetching NSE OI Spurts & Gainers/Losers...")
 
     try:
-        # Step 1: Get gainers/losers + OI spurts symbols from NSE live
-        await msg.edit(content="⏳ Fetching NSE Gainers/Losers & OI Spurts...")
+        # ── Step 1: Get live NSE symbols ──────────────────────────────────────
         session = make_nse_session()
+        oi_spurts_syms      = fetch_oi_spurts_symbols(session)
+        gainers_losers_syms = fetch_gainers_losers_symbols(session)
 
-        gainers_losers_symbols = fetch_nse_gainers_losers(session)
-        oi_spurts_symbols      = fetch_oi_spurts(session)
+        common = oi_spurts_syms & gainers_losers_syms
+        print(f"[filter] OI Spurts={len(oi_spurts_syms)}, G/L={len(gainers_losers_syms)}, Common={len(common)} → {common}")
 
-        # Intersection — only symbols in BOTH
-        common_symbols = gainers_losers_symbols & oi_spurts_symbols
-        print(f"[filter] Common symbols (OI Spurts ∩ Gainers/Losers): {common_symbols}")
+        # ── Step 2: Download Bhav Copy ────────────────────────────────────────
+        await msg.edit(content="⏳ Step 2/3 — Downloading NSE Bhav Copy...")
+        csv_data, date_label, _ = get_most_recent_bhav()
 
-        # Step 2: Download Bhav Copy for OI change data
-        await msg.edit(content="⏳ Downloading NSE Bhav Copy...")
-        date = get_prev_trading_day()
-        csv_content = date_label = None
-
-        for _ in range(7):
-            csv_content, date_label = fetch_bhav_copy(date)
-            if csv_content:
-                break
-            date -= timedelta(days=1)
-            while date.weekday() in (5, 6):
-                date -= timedelta(days=1)
-
-        if not csv_content:
-            await msg.edit(content="❌ Couldn't fetch Bhav Copy.")
+        if not csv_data:
+            await msg.edit(content="❌ Could not download Bhav Copy from NSE.")
             return
 
-        # Step 3: Parse with filter
-        await msg.edit(content=f"⏳ Parsing **{date_label}** data...")
+        # ── Step 3: Parse ─────────────────────────────────────────────────────
+        await msg.edit(content=f"⏳ Step 3/3 — Parsing **{date_label}** data...")
 
-        # Use common symbols as filter (if we got any from live API)
-        filter_set = common_symbols if common_symbols else None
+        if not common:
+            # Market closed or NSE API blocked — show all with threshold
+            note = (
+                f"⚠️ NSE live API returned no data (market may be closed).\n"
+                f"Showing **all** stocks with OI change ≥ ±{threshold}% from Bhav Copy.\n\n"
+            )
+            filter_set = None
+        else:
+            note = f"*(Stocks in both OI Spurts & Gainers/Losers — {len(common)} matched)*\n\n"
+            filter_set = common
 
-        if not common_symbols:
-            await msg.edit(content=(
-                f"⚠️ NSE live API returned no common symbols "
-                f"(market may be closed). Showing all OI ≥±{threshold}% stocks instead."
-            ))
-            await ctx.send("⏳ Parsing Bhav Copy without filter...")
+        gainers, losers = parse_bhav_oi(csv_data, threshold, filter_symbols=filter_set)
 
-        gainers, losers = parse_bhav_oi(csv_content, threshold, filter_symbols=filter_set)
-
-        title = (
-            f"📊 **NSE — OI Spurts ∩ Gainers/Losers | ±{threshold}% | {date_label}**\n"
-            f"*(Stocks in both OI Spurts & Top Gainers/Losers)*"
-        )
+        header_msg = f"📊 **NSE F&O | ±{threshold}% OI Change | {date_label}**\n{note}"
         gainer_chunks = fmt(f"OI Gainers (≥+{threshold}%)", gainers, "📈")
         loser_chunks  = fmt(f"OI Losers  (≤-{threshold}%)", losers,  "📉")
-        all_chunks    = [title] + gainer_chunks + loser_chunks
+        all_chunks    = [header_msg] + gainer_chunks + loser_chunks
 
         first = True
         for chunk in all_chunks:
@@ -308,28 +306,17 @@ async def nse_oi(ctx, threshold: float = 2.0):
 
 @bot.command(name="debug")
 async def debug_csv(ctx):
-    msg = await ctx.send("⏳ Fetching for debug...")
+    msg = await ctx.send("⏳ Fetching debug info...")
     try:
-        date = get_prev_trading_day()
-        for _ in range(7):
-            csv_content, date_label = fetch_bhav_copy(date)
-            if csv_content:
-                break
-            date -= timedelta(days=1)
-            while date.weekday() in (5, 6):
-                date -= timedelta(days=1)
-
+        csv_data, date_label, _ = get_most_recent_bhav()
         rows = [{k.strip(): v.strip() for k, v in row.items()}
-                for row in csv.DictReader(io.StringIO(csv_content))]
-        inst_types = set(r.get("FinInstrmTp", r.get("Instrument", "?")) for r in rows[:500])
-        cols = list(rows[0].keys()) if rows else []
-
+                for row in csv.DictReader(io.StringIO(csv_data))]
+        inst_types = set(r.get("FinInstrmTp", "?") for r in rows[:500])
         out = (
-            f"**Debug — {date_label}**\n"
-            f"```\nTotal rows: {len(rows)}\n"
-            f"Columns: {cols}\n"
+            f"**Debug — {date_label}**\n```\n"
+            f"Total rows: {len(rows)}\n"
             f"Instrument types: {sorted(inst_types)}\n"
-            f"Sample: {dict(list(rows[0].items())[:6])}\n```"
+            f"Columns: {list(rows[0].keys()) if rows else []}\n```"
         )
         await msg.edit(content=out[:1990])
     except Exception as e:
