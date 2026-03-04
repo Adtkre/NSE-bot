@@ -28,29 +28,13 @@ HEADERS = {
 FUTURES_TYPES = {"STF", "IDF"}
 
 
-def make_nse_session():
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    try:
-        session.get("https://www.nseindia.com", timeout=15)
-        time.sleep(random.uniform(1.5, 2.5))
-        session.get("https://www.nseindia.com/market-data/oi-spurts", timeout=15)
-        time.sleep(random.uniform(1, 2))
-    except Exception:
-        pass
-    return session
-
-
 def fetch_bhav_copy(date: datetime):
-    """Try to download Bhav Copy for given date. Returns (csv_content, date_label) or (None, date_label)."""
     date_str   = date.strftime("%Y%m%d")
     date_label = date.strftime("%d %b %Y (%A)")
-
     urls = [
         f"https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{date_str}_F_0000.csv.zip",
         f"https://www.nseindia.com/content/historical/DERIVATIVES/{date.year}/{date.strftime('%b').upper()}/fo{date.strftime('%d%b%Y').upper()}bhav.csv.zip",
     ]
-
     session = requests.Session()
     session.headers.update(HEADERS)
     try:
@@ -71,92 +55,33 @@ def fetch_bhav_copy(date: datetime):
                 return csv_data, date_label
         except Exception as e:
             print(f"[bhav] error: {e}")
-            continue
-
-    print(f"[bhav] ❌ No data for {date_label}")
     return None, date_label
 
 
 def get_most_recent_bhav():
-    """
-    Find the most recent available Bhav Copy.
-    Start from yesterday, go back up to 7 trading days.
-    """
     day = datetime.now() - timedelta(days=1)
-    # Skip weekends
     while day.weekday() in (5, 6):
         day -= timedelta(days=1)
-
     for _ in range(7):
         csv_data, date_label = fetch_bhav_copy(day)
         if csv_data:
-            return csv_data, date_label, day
-        # Go back one more trading day
+            return csv_data, date_label
         day -= timedelta(days=1)
         while day.weekday() in (5, 6):
             day -= timedelta(days=1)
-
-    return None, None, None
-
-
-def fetch_oi_spurts_symbols(session):
-    """Fetch symbols from NSE OI Spurts page."""
-    symbols = set()
-    url = "https://www.nseindia.com/api/live-analysis-oi-spurts-underlyings"
-    try:
-        r = session.get(url, timeout=15)
-        print(f"[oi-spurts] status={r.status_code} len={len(r.text)}")
-        if r.status_code == 200:
-            text = r.text.strip()
-            if text and text[0] in ('[', '{'):
-                data = r.json()
-                records = data if isinstance(data, list) else data.get("data", [])
-                for item in records:
-                    sym = item.get("symbol", item.get("Symbol", "")).strip().upper()
-                    if sym:
-                        symbols.add(sym)
-    except Exception as e:
-        print(f"[oi-spurts] error: {e}")
-    print(f"[oi-spurts] found {len(symbols)} symbols: {list(symbols)[:10]}")
-    return symbols
+    return None, None
 
 
-def fetch_gainers_losers_symbols(session):
-    """Fetch symbols from NSE Top Gainers & Losers."""
-    symbols = set()
-    urls = [
-        "https://www.nseindia.com/api/live-analysis-variations?index=gainers&limit=50",
-        "https://www.nseindia.com/api/live-analysis-variations?index=loosers&limit=50",
-    ]
-    for url in urls:
-        try:
-            r = session.get(url, timeout=15)
-            print(f"[gainers/losers] {url} → {r.status_code}")
-            if r.status_code == 200:
-                text = r.text.strip()
-                if not text or text[0] not in ('[', '{'):
-                    continue
-                data = r.json()
-                # NSE returns nested dict with keys like NIFTY, BANKNIFTY etc
-                if isinstance(data, dict):
-                    for key, val in data.items():
-                        if isinstance(val, list):
-                            for item in val:
-                                sym = item.get("symbol", item.get("Symbol", "")).strip().upper()
-                                if sym:
-                                    symbols.add(sym)
-                elif isinstance(data, list):
-                    for item in data:
-                        sym = item.get("symbol", item.get("Symbol", "")).strip().upper()
-                        if sym:
-                            symbols.add(sym)
-        except Exception as e:
-            print(f"[gainers/losers] error: {e}")
-    print(f"[gainers/losers] found {len(symbols)} symbols: {list(symbols)[:10]}")
-    return symbols
+def parse_bhav(csv_content, oi_threshold_pct, price_threshold_pct=2.0):
+    """
+    Parse Bhav Copy and return stocks that are in BOTH:
+    1. OI Spurts     → OI change >= +oi_threshold% (big OI buildup)
+    2. Gainers       → Price change >= +price_threshold% 
+       OR Losers     → Price change <= -price_threshold%
 
-
-def parse_bhav_oi(csv_content, threshold_pct, filter_symbols=None):
+    Returns: gainers_list, losers_list
+    Each item has symbol, oi_pct, price_pct, prev_oi, curr_oi, ltp
+    """
     reader = csv.DictReader(io.StringIO(csv_content))
     rows = [{k.strip(): v.strip() for k, v in row.items()} for row in reader]
 
@@ -164,69 +89,94 @@ def parse_bhav_oi(csv_content, threshold_pct, filter_symbols=None):
         raise Exception("CSV is empty.")
 
     symbol_data = {}
+
     for row in rows:
-        inst = row.get("FinInstrmTp", row.get("Instrument", row.get("INSTRUMENT", ""))).strip()
+        inst = row.get("FinInstrmTp", row.get("Instrument", "")).strip()
         is_future = inst in FUTURES_TYPES or "FUT" in inst.upper()
         if not is_future:
             continue
 
-        symbol = row.get("TckrSymb", row.get("Symbol", row.get("SYMBOL", ""))).strip().upper()
+        symbol = row.get("TckrSymb", row.get("Symbol", "")).strip().upper()
         if not symbol:
             continue
 
-        if filter_symbols is not None and symbol not in filter_symbols:
-            continue
-
         try:
-            curr_oi = float(row.get("OpnIntrst",       row.get("OPEN_INT", "0")).replace(",", "") or 0)
-            oi_chg  = float(row.get("ChngInOpnIntrst", row.get("CHG_IN_OI", "0")).replace(",", "") or 0)
-            ltp     = float(row.get("ClsPric",          row.get("CLOSE", row.get("SttlmPric", "0"))).replace(",", "") or 0)
+            curr_oi   = float(row.get("OpnIntrst",       row.get("OPEN_INT",   "0")).replace(",", "") or 0)
+            oi_chg    = float(row.get("ChngInOpnIntrst",  row.get("CHG_IN_OI",  "0")).replace(",", "") or 0)
+            ltp       = float(row.get("ClsPric",           row.get("CLOSE",      row.get("SttlmPric", "0"))).replace(",", "") or 0)
+            prev_close= float(row.get("PrvsClsgPric",      row.get("PREV_CLOSE", "0")).replace(",", "") or 0)
         except ValueError:
             continue
 
         if symbol not in symbol_data:
-            symbol_data[symbol] = {"curr_oi": 0.0, "oi_chg": 0.0, "ltp": 0.0}
-        symbol_data[symbol]["curr_oi"] += curr_oi
-        symbol_data[symbol]["oi_chg"]  += oi_chg
+            symbol_data[symbol] = {"curr_oi": 0.0, "oi_chg": 0.0, "ltp": 0.0, "prev_close": 0.0}
+
+        symbol_data[symbol]["curr_oi"]   += curr_oi
+        symbol_data[symbol]["oi_chg"]    += oi_chg
         if ltp:
             symbol_data[symbol]["ltp"] = ltp
+        if prev_close:
+            symbol_data[symbol]["prev_close"] = prev_close
 
-    print(f"[parse] symbols after filter: {len(symbol_data)}")
+    gainers = []
+    losers  = []
 
-    results = []
     for sym, d in symbol_data.items():
         prev_oi = d["curr_oi"] - d["oi_chg"]
         if prev_oi <= 0:
             continue
-        oi_pct = (d["oi_chg"] / prev_oi) * 100
-        results.append({
-            "symbol":  sym,
-            "oi_pct":  round(oi_pct, 2),
-            "prev_oi": int(prev_oi),
-            "curr_oi": int(d["curr_oi"]),
-            "ltp":     d["ltp"],
-        })
 
-    gainers = sorted([r for r in results if r["oi_pct"] >=  threshold_pct], key=lambda x: -x["oi_pct"])
-    losers  = sorted([r for r in results if r["oi_pct"] <= -threshold_pct], key=lambda x:  x["oi_pct"])
+        oi_pct = (d["oi_chg"] / prev_oi) * 100
+
+        # Price change %
+        price_pct = 0.0
+        if d["prev_close"] > 0:
+            price_pct = ((d["ltp"] - d["prev_close"]) / d["prev_close"]) * 100
+
+        row_data = {
+            "symbol":    sym,
+            "oi_pct":    round(oi_pct, 2),
+            "price_pct": round(price_pct, 2),
+            "prev_oi":   int(prev_oi),
+            "curr_oi":   int(d["curr_oi"]),
+            "ltp":       d["ltp"],
+        }
+
+        # Must have significant OI change (OI spurt condition)
+        if abs(oi_pct) < oi_threshold_pct:
+            continue
+
+        # Gainer: OI up + Price up
+        if oi_pct >= oi_threshold_pct and price_pct >= price_threshold_pct:
+            gainers.append(row_data)
+
+        # Loser: OI up + Price down (short buildup) OR OI down + Price down
+        elif price_pct <= -price_threshold_pct:
+            losers.append(row_data)
+
+    gainers.sort(key=lambda x: -x["oi_pct"])
+    losers.sort(key=lambda x:   x["price_pct"])
+
     return gainers, losers
 
 
 def fmt(title, rows, emoji):
     if not rows:
         return [f"**{emoji} {title}**\n*No stocks found*"]
+
     header = (
         f"**{emoji} {title}** ({len(rows)} stocks)\n"
         f"```\n"
-        f"{'Symbol':<14} {'OI Chg%':>8}  {'Prev OI':>11}  {'Curr OI':>11}  {'LTP':>8}\n"
-        f"{'─' * 60}\n"
+        f"{'Symbol':<14} {'OI Chg%':>8}  {'Price%':>7}  {'Prev OI':>11}  {'Curr OI':>11}  {'LTP':>8}\n"
+        f"{'─' * 68}\n"
     )
     footer = "```"
     row_lines = [
-        f"{r['symbol']:<14} {r['oi_pct']:>+7.2f}%  "
+        f"{r['symbol']:<14} {r['oi_pct']:>+7.2f}%  {r['price_pct']:>+6.2f}%  "
         f"{r['prev_oi']:>11,}  {r['curr_oi']:>11,}  {r['ltp']:>8.2f}"
         for r in rows
     ]
+
     chunks = []
     current = header
     for line in row_lines:
@@ -240,54 +190,37 @@ def fmt(title, rows, emoji):
 
 
 @bot.command(name="nse")
-async def nse_oi(ctx, threshold: float = 2.0):
+async def nse_oi(ctx, oi_threshold: float = 2.0, price_threshold: float = 2.0):
     """
-    !nse <percent>
-    Shows stocks present in BOTH NSE OI Spurts AND Top Gainers/Losers,
-    with OI change >= ±threshold% from Bhav Copy EOD data.
+    !nse <oi%> [price%]
+    Shows stocks with OI change >= ±oi% AND price change >= ±price%
+    (mimics OI Spurts ∩ Top Gainers/Losers — works anytime, no live API needed)
+
+    Examples:
+      !nse 3        → OI >= 3% AND Price >= 2% (default price threshold)
+      !nse 3 1.5    → OI >= 3% AND Price >= 1.5%
     """
-    if not 0.1 <= threshold <= 100:
-        await ctx.send("❌ Example: `!nse 3`")
+    if not 0.1 <= oi_threshold <= 100:
+        await ctx.send("❌ Example: `!nse 3` or `!nse 3 1.5`")
         return
 
-    msg = await ctx.send("⏳ Step 1/3 — Fetching NSE OI Spurts & Gainers/Losers...")
+    msg = await ctx.send("⏳ Downloading NSE Bhav Copy...")
 
     try:
-        # ── Step 1: Get live NSE symbols ──────────────────────────────────────
-        session = make_nse_session()
-        oi_spurts_syms      = fetch_oi_spurts_symbols(session)
-        gainers_losers_syms = fetch_gainers_losers_symbols(session)
-
-        common = oi_spurts_syms & gainers_losers_syms
-        print(f"[filter] OI Spurts={len(oi_spurts_syms)}, G/L={len(gainers_losers_syms)}, Common={len(common)} → {common}")
-
-        # ── Step 2: Download Bhav Copy ────────────────────────────────────────
-        await msg.edit(content="⏳ Step 2/3 — Downloading NSE Bhav Copy...")
-        csv_data, date_label, _ = get_most_recent_bhav()
-
+        csv_data, date_label = get_most_recent_bhav()
         if not csv_data:
             await msg.edit(content="❌ Could not download Bhav Copy from NSE.")
             return
 
-        # ── Step 3: Parse ─────────────────────────────────────────────────────
-        await msg.edit(content=f"⏳ Step 3/3 — Parsing **{date_label}** data...")
+        await msg.edit(content=f"⏳ Parsing **{date_label}** — filtering OI ≥±{oi_threshold}% & Price ≥±{price_threshold}%...")
 
-        if not common:
-            # Market closed or NSE API blocked — show all with threshold
-            note = (
-                f"⚠️ NSE live API returned no data (market may be closed).\n"
-                f"Showing **all** stocks with OI change ≥ ±{threshold}% from Bhav Copy.\n\n"
-            )
-            filter_set = None
-        else:
-            note = f"*(Stocks in both OI Spurts & Gainers/Losers — {len(common)} matched)*\n\n"
-            filter_set = common
+        gainers, losers = parse_bhav(csv_data, oi_threshold, price_threshold)
 
-        gainers, losers = parse_bhav_oi(csv_data, threshold, filter_symbols=filter_set)
+        note = f"*(OI change ≥ ±{oi_threshold}%  AND  Price change ≥ ±{price_threshold}%)*"
+        header_msg = f"📊 **NSE F&O | {date_label}**\n{note}\n"
 
-        header_msg = f"📊 **NSE F&O | ±{threshold}% OI Change | {date_label}**\n{note}"
-        gainer_chunks = fmt(f"OI Gainers (≥+{threshold}%)", gainers, "📈")
-        loser_chunks  = fmt(f"OI Losers  (≤-{threshold}%)", losers,  "📉")
+        gainer_chunks = fmt(f"Gainers — OI↑ + Price↑", gainers, "📈")
+        loser_chunks  = fmt(f"Losers  — Price↓",        losers,  "📉")
         all_chunks    = [header_msg] + gainer_chunks + loser_chunks
 
         first = True
@@ -306,17 +239,19 @@ async def nse_oi(ctx, threshold: float = 2.0):
 
 @bot.command(name="debug")
 async def debug_csv(ctx):
-    msg = await ctx.send("⏳ Fetching debug info...")
+    msg = await ctx.send("⏳ Debug...")
     try:
-        csv_data, date_label, _ = get_most_recent_bhav()
+        csv_data, date_label = get_most_recent_bhav()
         rows = [{k.strip(): v.strip() for k, v in row.items()}
                 for row in csv.DictReader(io.StringIO(csv_data))]
         inst_types = set(r.get("FinInstrmTp", "?") for r in rows[:500])
+        # Sample a futures row
+        fut_sample = next((r for r in rows if r.get("FinInstrmTp","") in FUTURES_TYPES), {})
         out = (
             f"**Debug — {date_label}**\n```\n"
             f"Total rows: {len(rows)}\n"
             f"Instrument types: {sorted(inst_types)}\n"
-            f"Columns: {list(rows[0].keys()) if rows else []}\n```"
+            f"Futures sample: {dict(list(fut_sample.items())[:8])}\n```"
         )
         await msg.edit(content=out[:1990])
     except Exception as e:
@@ -325,7 +260,7 @@ async def debug_csv(ctx):
 
 @bot.event
 async def on_ready():
-    print(f"✅ {bot.user} online | !nse <percent> | !debug")
+    print(f"✅ {bot.user} online | !nse <oi%> [price%] | !debug")
 
 
 bot.run(TOKEN)
