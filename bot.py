@@ -215,7 +215,7 @@ async def nse_oi(ctx, oi_threshold: float = 2.0):
             await msg.edit(content="❌ Could not download Bhav Copy from NSE.")
             return
 
-        await msg.edit(content=f"⏳ Parsing **{date_label}** — filtering OI ≥±{oi_threshold}% & Price ≥±{price_threshold}%...")
+        await msg.edit(content=f"⏳ Parsing **{date_label}** — OI ≥ ±{oi_threshold}%...")
 
         gainers, losers = parse_bhav(csv_data, oi_threshold)
 
