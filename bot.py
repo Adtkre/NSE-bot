@@ -80,15 +80,18 @@ def get_most_recent_bhav():
     return None, None
 
 
-def parse_bhav(csv_content, oi_threshold_pct, price_threshold_pct=2.0):
+def parse_bhav(csv_content, oi_threshold_pct):
     """
-    Parse Bhav Copy and return stocks that are in BOTH:
-    1. OI Spurts     → OI change >= +oi_threshold% (big OI buildup)
-    2. Gainers       → Price change >= +price_threshold% 
-       OR Losers     → Price change <= -price_threshold%
+    Intersection of OI Spurts AND Gainers/Losers — from Bhav Copy only:
 
-    Returns: gainers_list, losers_list
-    Each item has symbol, oi_pct, price_pct, prev_oi, curr_oi, ltp
+    OI Spurts condition  → |OI change| >= oi_threshold%
+    Gainer condition     → Price went UP   (ltp > prev_close)
+    Loser  condition     → Price went DOWN (ltp < prev_close)
+
+    Final output:
+    - Gainers: OI change >= +threshold% AND price went up
+    - Losers:  OI change >= +threshold% AND price went down
+               OR OI change <= -threshold% (long unwinding — bearish)
     """
     reader = csv.DictReader(io.StringIO(csv_content))
     rows = [{k.strip(): v.strip() for k, v in row.items()} for row in reader]
@@ -109,22 +112,20 @@ def parse_bhav(csv_content, oi_threshold_pct, price_threshold_pct=2.0):
             continue
 
         try:
-            curr_oi   = float(row.get("OpnIntrst",       row.get("OPEN_INT",   "0")).replace(",", "") or 0)
-            oi_chg    = float(row.get("ChngInOpnIntrst",  row.get("CHG_IN_OI",  "0")).replace(",", "") or 0)
-            ltp       = float(row.get("ClsPric",           row.get("CLOSE",      row.get("SttlmPric", "0"))).replace(",", "") or 0)
-            prev_close= float(row.get("PrvsClsgPric",      row.get("PREV_CLOSE", "0")).replace(",", "") or 0)
+            curr_oi    = float(row.get("OpnIntrst",      row.get("OPEN_INT",   "0")).replace(",", "") or 0)
+            oi_chg     = float(row.get("ChngInOpnIntrst", row.get("CHG_IN_OI",  "0")).replace(",", "") or 0)
+            ltp        = float(row.get("ClsPric",          row.get("CLOSE",      row.get("SttlmPric",   "0"))).replace(",", "") or 0)
+            prev_close = float(row.get("PrvsClsgPric",     row.get("PREV_CLOSE", "0")).replace(",", "") or 0)
         except ValueError:
             continue
 
         if symbol not in symbol_data:
             symbol_data[symbol] = {"curr_oi": 0.0, "oi_chg": 0.0, "ltp": 0.0, "prev_close": 0.0}
 
-        symbol_data[symbol]["curr_oi"]   += curr_oi
-        symbol_data[symbol]["oi_chg"]    += oi_chg
-        if ltp:
-            symbol_data[symbol]["ltp"] = ltp
-        if prev_close:
-            symbol_data[symbol]["prev_close"] = prev_close
+        symbol_data[symbol]["curr_oi"] += curr_oi
+        symbol_data[symbol]["oi_chg"]  += oi_chg
+        if ltp:        symbol_data[symbol]["ltp"]        = ltp
+        if prev_close: symbol_data[symbol]["prev_close"] = prev_close
 
     gainers = []
     losers  = []
@@ -134,12 +135,14 @@ def parse_bhav(csv_content, oi_threshold_pct, price_threshold_pct=2.0):
         if prev_oi <= 0:
             continue
 
-        oi_pct = (d["oi_chg"] / prev_oi) * 100
-
-        # Price change %
+        oi_pct    = (d["oi_chg"] / prev_oi) * 100
         price_pct = 0.0
         if d["prev_close"] > 0:
             price_pct = ((d["ltp"] - d["prev_close"]) / d["prev_close"]) * 100
+
+        # Only stocks with significant OI change (OI Spurts condition)
+        if abs(oi_pct) < oi_threshold_pct:
+            continue
 
         row_data = {
             "symbol":    sym,
@@ -150,21 +153,17 @@ def parse_bhav(csv_content, oi_threshold_pct, price_threshold_pct=2.0):
             "ltp":       d["ltp"],
         }
 
-        # Must have significant OI change (OI spurt condition)
-        if abs(oi_pct) < oi_threshold_pct:
-            continue
-
-        # Gainer: OI up + Price up
-        if oi_pct >= oi_threshold_pct and price_pct >= price_threshold_pct:
+        # Gainer = OI buildup + price went UP (long buildup)
+        if oi_pct >= oi_threshold_pct and price_pct > 0:
             gainers.append(row_data)
 
-        # Loser: OI up + Price down (short buildup) OR OI down + Price down
-        elif price_pct <= -price_threshold_pct:
+        # Loser = OI buildup + price went DOWN (short buildup)
+        #       OR OI unwinding + price went DOWN (long exit)
+        elif price_pct < 0:
             losers.append(row_data)
 
     gainers.sort(key=lambda x: -x["oi_pct"])
     losers.sort(key=lambda x:   x["price_pct"])
-
     return gainers, losers
 
 
@@ -198,15 +197,11 @@ def fmt(title, rows, emoji):
 
 
 @bot.command(name="nse")
-async def nse_oi(ctx, oi_threshold: float = 2.0, price_threshold: float = 2.0):
+async def nse_oi(ctx, oi_threshold: float = 2.0):
     """
-    !nse <oi%> [price%]
-    Shows stocks with OI change >= ±oi% AND price change >= ±price%
-    (mimics OI Spurts ∩ Top Gainers/Losers — works anytime, no live API needed)
-
-    Examples:
-      !nse 3        → OI >= 3% AND Price >= 2% (default price threshold)
-      !nse 3 1.5    → OI >= 3% AND Price >= 1.5%
+    !nse <percent>
+    Shows F&O futures with OI change >= +X% (gainers) or <= -X% (losers).
+    Example: !nse 3
     """
     if not 0.1 <= oi_threshold <= 100:
         await ctx.send("❌ Example: `!nse 3` or `!nse 3 1.5`")
@@ -222,13 +217,13 @@ async def nse_oi(ctx, oi_threshold: float = 2.0, price_threshold: float = 2.0):
 
         await msg.edit(content=f"⏳ Parsing **{date_label}** — filtering OI ≥±{oi_threshold}% & Price ≥±{price_threshold}%...")
 
-        gainers, losers = parse_bhav(csv_data, oi_threshold, price_threshold)
+        gainers, losers = parse_bhav(csv_data, oi_threshold)
 
-        note = f"*(OI change ≥ ±{oi_threshold}%  AND  Price change ≥ ±{price_threshold}%)*"
+        note = f"*(OI Spurts ∩ Gainers/Losers — OI change ≥ ±{oi_threshold}%)*"
         header_msg = f"📊 **NSE F&O | {date_label}**\n{note}\n"
 
-        gainer_chunks = fmt(f"Gainers — OI↑ + Price↑", gainers, "📈")
-        loser_chunks  = fmt(f"Losers  — Price↓",        losers,  "📉")
+        gainer_chunks = fmt(f"OI Spurts + Gainers (OI≥+{oi_threshold}% & Price↑)", gainers, "📈")
+        loser_chunks  = fmt(f"OI Spurts + Losers  (OI≥±{oi_threshold}% & Price↓)", losers,  "📉")
         all_chunks    = [header_msg] + gainer_chunks + loser_chunks
 
         first = True
