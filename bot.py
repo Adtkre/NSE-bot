@@ -263,7 +263,7 @@ async def debug_csv(ctx):
 
 @bot.event
 async def on_ready():
-    print(f"✅ {bot.user} online | !nse <oi%> [price%] | !debug")
+    print(f" {bot.user} online | !nse <oi%> [price%] | !debug")
 
 
 bot.run(TOKEN)
